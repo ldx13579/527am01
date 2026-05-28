@@ -1,35 +1,34 @@
 """
-Cresci-2017 Bot Detection with Graph Neural Networks
-=====================================================
+Temporal Bot Detection: GIN+GRU with Self-Supervised Edge Prediction
+====================================================================
 - Dataset: Simulated Cresci-2017 (~5000 users, 5 features)
-- Features: followers_count, friends_count, tweet_frequency, url_ratio, sentiment_score
-- Graph: Homogeneous user graph with co-mention edges
-- Models: 2-layer GIN (hidden=64), GCN, GraphSAGE
-- Evaluation: F1 score on 10% test set
-- Visualization: GIN first-layer neighbor aggregation patterns
+- Temporal Graph: 3 daily time slices with evolving edges + time-varying node features
+- Models: GIN+GRU (temporal) vs GIN-Only (static baseline)
+- Self-supervised: 10% edge masking per slice, loss summed across all slices
+- Evaluation: Low-activity bot recall with only 200 labeled samples
 """
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.data import Data
-from torch_geometric.nn import GINConv, GCNConv, SAGEConv
-from torch_geometric.utils import to_networkx
+from torch_geometric.nn import GINConv
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, classification_report
+from sklearn.metrics import f1_score, recall_score, precision_score, classification_report
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
-import seaborn as sns
-import networkx as nx
-import random
+import matplotlib
+matplotlib.use('Agg')
 import os
+import random
 
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 OUTPUT_DIR = 'outputs'
@@ -37,15 +36,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # =============================================================================
-# 1. Data Simulation (Cresci-2017 Style)
+# 1. Temporal Data Simulation
 # =============================================================================
 
-def simulate_cresci2017(n_users=5000, bot_ratio=0.4):
-    """
-    Simulate Cresci-2017 dataset characteristics.
-    Genuine users: ~3000, Bots: ~2000
-    Features: followers_count, friends_count, tweet_frequency, url_ratio, sentiment_score
-    """
+def simulate_cresci2017_temporal(n_users=5000, bot_ratio=0.4, n_days=3):
     n_bots = int(n_users * bot_ratio)
     n_genuine = n_users - n_bots
 
@@ -56,85 +50,171 @@ def simulate_cresci2017(n_users=5000, bot_ratio=0.4):
     genuine_url_ratio = np.random.beta(a=2, b=8, size=n_genuine)
     genuine_sentiment = np.random.normal(loc=0.1, scale=0.3, size=n_genuine).clip(-1, 1)
 
-    # Bot features (different distributions)
-    bot_followers = np.random.lognormal(mean=3.0, sigma=2.0, size=n_bots).clip(0, 1e5)
-    bot_friends = np.random.lognormal(mean=6.0, sigma=1.0, size=n_bots).clip(0, 5e5)
-    bot_tweet_freq = np.random.exponential(scale=15.0, size=n_bots).clip(0, 200)
-    bot_url_ratio = np.random.beta(a=5, b=3, size=n_bots)
-    bot_sentiment = np.random.normal(loc=-0.05, scale=0.15, size=n_bots).clip(-1, 1)
+    # Regular bots
+    n_low_activity = int(n_bots * 0.25)
+    n_regular_bots = n_bots - n_low_activity
+
+    reg_bot_followers = np.random.lognormal(mean=3.0, sigma=2.0, size=n_regular_bots).clip(0, 1e5)
+    reg_bot_friends = np.random.lognormal(mean=6.0, sigma=1.0, size=n_regular_bots).clip(0, 5e5)
+    reg_bot_tweet_freq = np.random.exponential(scale=15.0, size=n_regular_bots).clip(0, 200)
+    reg_bot_url_ratio = np.random.beta(a=5, b=3, size=n_regular_bots)
+    reg_bot_sentiment = np.random.normal(loc=-0.05, scale=0.15, size=n_regular_bots).clip(-1, 1)
+
+    # Low-activity bots (stealthy)
+    low_bot_followers = np.random.lognormal(mean=4.0, sigma=1.5, size=n_low_activity).clip(0, 5e4)
+    low_bot_friends = np.random.lognormal(mean=4.8, sigma=1.0, size=n_low_activity).clip(0, 2e5)
+    low_bot_tweet_freq = np.random.exponential(scale=1.0, size=n_low_activity).clip(0, 5)
+    low_bot_url_ratio = np.random.beta(a=3, b=5, size=n_low_activity)
+    low_bot_sentiment = np.random.normal(loc=0.0, scale=0.2, size=n_low_activity).clip(-1, 1)
 
     # Combine
-    followers = np.concatenate([genuine_followers, bot_followers])
-    friends = np.concatenate([genuine_friends, bot_friends])
-    tweet_freq = np.concatenate([genuine_tweet_freq, bot_tweet_freq])
-    url_ratio = np.concatenate([genuine_url_ratio, bot_url_ratio])
-    sentiment = np.concatenate([genuine_sentiment, bot_sentiment])
-    labels = np.array([0] * n_genuine + [1] * n_bots)
+    followers = np.concatenate([genuine_followers, reg_bot_followers, low_bot_followers])
+    friends = np.concatenate([genuine_friends, reg_bot_friends, low_bot_friends])
+    tweet_freq = np.concatenate([genuine_tweet_freq, reg_bot_tweet_freq, low_bot_tweet_freq])
+    url_ratio = np.concatenate([genuine_url_ratio, reg_bot_url_ratio, low_bot_url_ratio])
+    sentiment = np.concatenate([genuine_sentiment, reg_bot_sentiment, low_bot_sentiment])
+    labels = np.array([0] * n_genuine + [1] * n_regular_bots + [1] * n_low_activity)
+
+    low_activity_mask_pre = np.zeros(n_users, dtype=bool)
+    low_activity_mask_pre[n_genuine + n_regular_bots:] = True
 
     # Shuffle
     indices = np.random.permutation(n_users)
-    features = np.column_stack([followers, friends, tweet_freq, url_ratio, sentiment])[indices]
+    features_raw = np.column_stack([followers, friends, tweet_freq, url_ratio, sentiment])[indices]
     labels = labels[indices]
+    low_activity_mask = low_activity_mask_pre[indices]
 
-    # Normalize features
+    # Generate time-varying node features for each day
+    # Base features are Day 1; subsequent days add drift + noise
+    # Genuine users: small random noise (natural fluctuation)
+    # Regular bots: increasing tweet_freq drift (ramp-up campaign)
+    # Low-activity bots: sudden sentiment shift + url_ratio spike on Day 2-3
     scaler = StandardScaler()
-    features = scaler.fit_transform(features)
+    base_features = scaler.fit_transform(features_raw)
 
-    return features, labels, indices
+    features_per_day = []
+    for day in range(n_days):
+        day_features = base_features.copy()
+
+        # Global noise (all users have natural daily fluctuation)
+        noise = np.random.normal(0, 0.03, size=day_features.shape)
+        day_features += noise
+
+        if day >= 1:
+            # Regular bots: tweet frequency drifts up over time
+            reg_bot_mask = (labels == 1) & (~low_activity_mask)
+            drift_scale = 0.1 * day
+            day_features[reg_bot_mask, 2] += np.random.normal(drift_scale, 0.03,
+                                                               size=reg_bot_mask.sum())
+
+            # Low-activity bots: subtle oscillating drift (not monotone)
+            # The pattern is: Day1=baseline, Day2=+shift, Day3=back toward baseline
+            # Only by observing the full sequence can the model detect the anomalous
+            # "pulse" pattern vs. genuine users who stay stable
+            low_bot_mask = low_activity_mask
+            if day == 1:
+                # Spike on Day 2
+                day_features[low_bot_mask, 3] += np.random.normal(0.25, 0.05,
+                                                                   size=low_bot_mask.sum())
+                day_features[low_bot_mask, 4] += np.random.normal(-0.2, 0.04,
+                                                                   size=low_bot_mask.sum())
+            elif day == 2:
+                # Partial revert on Day 3 (not identical to Day 1)
+                day_features[low_bot_mask, 3] += np.random.normal(0.08, 0.05,
+                                                                   size=low_bot_mask.sum())
+                day_features[low_bot_mask, 4] += np.random.normal(-0.06, 0.04,
+                                                                   size=low_bot_mask.sum())
+
+        features_per_day.append(day_features)
+
+    return features_per_day, labels, low_activity_mask
 
 
-def build_comention_graph(n_users=5000, n_edges=15000, labels=None):
-    """
-    Build co-mention graph: edge (u, v) if users u and v mentioned same entity.
-    Bots tend to co-mention with other bots (homophily).
-    """
-    edges = set()
+def build_temporal_graphs(n_users=5000, labels=None, low_activity_mask=None, n_days=3):
     bot_indices = np.where(labels == 1)[0]
     genuine_indices = np.where(labels == 0)[0]
+    regular_bot_indices = np.where((labels == 1) & (~low_activity_mask))[0]
+    low_bot_indices = np.where((labels == 1) & low_activity_mask)[0]
 
-    # Intra-bot edges (bots co-mention each other more)
-    n_bot_edges = int(n_edges * 0.4)
-    while len(edges) < n_bot_edges:
-        u, v = np.random.choice(bot_indices, 2, replace=False)
-        if u != v:
-            edge = (min(u, v), max(u, v))
-            if edge not in edges:
-                edges.add(edge)
+    edge_targets = [10000, 12000, 14000]
+    retention_rates = [1.0, 0.70, 0.60]
 
-    # Intra-genuine edges
-    n_genuine_edges = int(n_edges * 0.35)
-    while len(edges) < n_bot_edges + n_genuine_edges:
-        u, v = np.random.choice(genuine_indices, 2, replace=False)
-        if u != v:
-            edge = (min(u, v), max(u, v))
-            if edge not in edges:
-                edges.add(edge)
+    def generate_edges(n_target, bot_idx, genuine_idx, low_bot_idx, existing_edges=None, retain_rate=1.0):
+        edges = set()
+        if existing_edges is not None and retain_rate < 1.0:
+            retained = random.sample(list(existing_edges), int(len(existing_edges) * retain_rate))
+            edges.update(retained)
 
-    # Cross edges
-    while len(edges) < n_edges:
-        u = np.random.choice(n_users)
-        v = np.random.choice(n_users)
-        if u != v:
-            edge = (min(u, v), max(u, v))
-            if edge not in edges:
-                edges.add(edge)
+        n_bot_edges = int(n_target * 0.4)
+        attempts = 0
+        while len(edges) < n_bot_edges and attempts < n_bot_edges * 10:
+            u, v = np.random.choice(regular_bot_indices, 2, replace=False)
+            edges.add((min(u, v), max(u, v)))
+            attempts += 1
 
-    edge_list = list(edges)
-    src = [e[0] for e in edge_list]
-    dst = [e[1] for e in edge_list]
-    # Undirected: add both directions
-    edge_index = torch.tensor([src + dst, dst + src], dtype=torch.long)
-    return edge_index
+        n_genuine_target = int(n_target * 0.35)
+        target_so_far = n_bot_edges + n_genuine_target
+        attempts = 0
+        while len(edges) < target_so_far and attempts < n_genuine_target * 10:
+            u, v = np.random.choice(genuine_idx, 2, replace=False)
+            edges.add((min(u, v), max(u, v)))
+            attempts += 1
+
+        for bot_node in low_bot_idx:
+            n_edges_for_bot = np.random.randint(1, 3)
+            targets = np.random.choice(genuine_idx, n_edges_for_bot, replace=False)
+            for t in targets:
+                if t != bot_node:
+                    edges.add((min(bot_node, t), max(bot_node, t)))
+
+        attempts = 0
+        while len(edges) < n_target and attempts < n_target * 5:
+            u = np.random.randint(0, n_users)
+            v = np.random.randint(0, n_users)
+            if u != v:
+                edges.add((min(u, v), max(u, v)))
+            attempts += 1
+
+        return edges
+
+    edge_index_list = []
+    prev_edges = None
+
+    n_groups = len(low_bot_indices) // 10
+    low_bot_groups = [low_bot_indices[i*10:(i+1)*10] for i in range(n_groups)]
+
+    for day in range(n_days):
+        if day == 0:
+            day_edges = generate_edges(edge_targets[day], bot_indices, genuine_indices,
+                                       low_bot_indices, None, 1.0)
+        else:
+            day_edges = generate_edges(edge_targets[day], bot_indices, genuine_indices,
+                                       low_bot_indices, prev_edges, retention_rates[day])
+
+        coord_prob = [0.05, 0.25, 0.50][day]
+        for group in low_bot_groups:
+            for i in range(len(group)):
+                for j in range(i+1, len(group)):
+                    if np.random.random() < coord_prob:
+                        day_edges.add((min(group[i], group[j]), max(group[i], group[j])))
+
+        prev_edges = day_edges
+
+        edge_list = list(day_edges)
+        src = [e[0] for e in edge_list]
+        dst = [e[1] for e in edge_list]
+        edge_index = torch.tensor([src + dst, dst + src], dtype=torch.long)
+        edge_index_list.append(edge_index)
+
+    return edge_index_list
 
 
 # =============================================================================
 # 2. Model Definitions
 # =============================================================================
 
-class GINNet(nn.Module):
-    """2-layer Graph Isomorphism Network, hidden_dim=64"""
-
-    def __init__(self, in_channels, hidden_channels=64, num_classes=2):
+class GINEncoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels=64):
         super().__init__()
         mlp1 = nn.Sequential(
             nn.Linear(in_channels, hidden_channels),
@@ -150,97 +230,217 @@ class GINNet(nn.Module):
         )
         self.conv1 = GINConv(mlp1, train_eps=True)
         self.conv2 = GINConv(mlp2, train_eps=True)
-        self.classifier = nn.Linear(hidden_channels, num_classes)
         self.bn1 = nn.BatchNorm1d(hidden_channels)
         self.bn2 = nn.BatchNorm1d(hidden_channels)
 
     def forward(self, x, edge_index):
-        h1 = self.conv1(x, edge_index)
-        h1 = self.bn1(h1)
-        h1 = F.relu(h1)
-        h2 = self.conv2(h1, edge_index)
-        h2 = self.bn2(h2)
-        h2 = F.relu(h2)
-        out = self.classifier(h2)
-        return out
-
-    def get_first_layer_output(self, x, edge_index):
-        """Get first layer aggregation output for visualization"""
-        h1 = self.conv1(x, edge_index)
-        return h1
+        h = self.conv1(x, edge_index)
+        h = self.bn1(h)
+        h = F.relu(h)
+        h = self.conv2(h, edge_index)
+        h = self.bn2(h)
+        h = F.relu(h)
+        return h
 
 
-class GCNNet(nn.Module):
-    """2-layer GCN, hidden_dim=64"""
-
+class TemporalGINGRU(nn.Module):
     def __init__(self, in_channels, hidden_channels=64, num_classes=2):
         super().__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.gin_encoder = GINEncoder(in_channels, hidden_channels)
+        self.gru = nn.GRU(input_size=hidden_channels, hidden_size=hidden_channels,
+                          num_layers=1, batch_first=True)
         self.classifier = nn.Linear(hidden_channels, num_classes)
 
-    def forward(self, x, edge_index):
-        h = self.conv1(x, edge_index)
-        h = F.relu(h)
-        h = F.dropout(h, p=0.5, training=self.training)
-        h = self.conv2(h, edge_index)
-        h = F.relu(h)
-        out = self.classifier(h)
-        return out
+    def encode_temporal(self, x_list, edge_index_list):
+        """Encode all time slices through GIN + GRU, return last hidden state."""
+        embeddings = []
+        for x_t, edge_index in zip(x_list, edge_index_list):
+            h = self.gin_encoder(x_t, edge_index)
+            embeddings.append(h)
+        seq = torch.stack(embeddings, dim=1)  # [N, T, hidden]
+        output, _ = self.gru(seq)
+        return output[:, -1, :]  # [N, hidden]
+
+    def encode_all_steps(self, x_list, edge_index_list):
+        """Encode and return GRU output at every time step (for per-slice SSL)."""
+        embeddings = []
+        for x_t, edge_index in zip(x_list, edge_index_list):
+            h = self.gin_encoder(x_t, edge_index)
+            embeddings.append(h)
+        seq = torch.stack(embeddings, dim=1)  # [N, T, hidden]
+        output, _ = self.gru(seq)  # [N, T, hidden]
+        return output  # return all T steps
+
+    def forward(self, x_list, edge_index_list):
+        h = self.encode_temporal(x_list, edge_index_list)
+        return self.classifier(h)
 
 
-class GraphSAGENet(nn.Module):
-    """2-layer GraphSAGE, hidden_dim=64"""
-
+class GINOnly(nn.Module):
     def __init__(self, in_channels, hidden_channels=64, num_classes=2):
         super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels)
-        self.conv2 = SAGEConv(hidden_channels, hidden_channels)
+        self.gin_encoder = GINEncoder(in_channels, hidden_channels)
         self.classifier = nn.Linear(hidden_channels, num_classes)
 
-    def forward(self, x, edge_index):
-        h = self.conv1(x, edge_index)
-        h = F.relu(h)
-        h = F.dropout(h, p=0.5, training=self.training)
-        h = self.conv2(h, edge_index)
-        h = F.relu(h)
-        out = self.classifier(h)
-        return out
+    def forward(self, x_list, edge_index_list):
+        h = self.gin_encoder(x_list[-1], edge_index_list[-1])
+        return self.classifier(h)
+
+    def encode(self, x_list, edge_index_list):
+        return self.gin_encoder(x_list[-1], edge_index_list[-1])
+
+
+class EdgePredictor(nn.Module):
+    def __init__(self, hidden_channels=64):
+        super().__init__()
+        self.proj = nn.Linear(hidden_channels, hidden_channels)
+
+    def forward(self, z, pos_edges, neg_edges):
+        z_proj = self.proj(z)
+        pos_scores = (z_proj[pos_edges[0]] * z_proj[pos_edges[1]]).sum(dim=1)
+        neg_scores = (z_proj[neg_edges[0]] * z_proj[neg_edges[1]]).sum(dim=1)
+        return pos_scores, neg_scores
 
 
 # =============================================================================
-# 3. Training and Evaluation
+# 3. Self-Supervised Pretraining (Per-Slice Edge Prediction)
 # =============================================================================
 
-def train_model(model, data, train_mask, val_mask, epochs=200, lr=0.01):
+def mask_edges(edge_index, mask_ratio=0.1):
+    num_edges = edge_index.shape[1]
+    half = num_edges // 2
+    n_mask = int(half * mask_ratio)
+    perm = torch.randperm(half)
+    mask_idx = perm[:n_mask]
+
+    masked_pos = edge_index[:, mask_idx]
+
+    keep_mask = torch.ones(half, dtype=torch.bool)
+    keep_mask[mask_idx] = False
+    keep_idx = torch.cat([torch.where(keep_mask)[0], torch.where(keep_mask)[0] + half])
+    remaining_edge_index = edge_index[:, keep_idx]
+
+    return remaining_edge_index, masked_pos
+
+
+def negative_sampling(edge_index, n_nodes, n_samples):
+    edge_set = set()
+    ei = edge_index.cpu().numpy()
+    for i in range(ei.shape[1]):
+        edge_set.add((ei[0, i], ei[1, i]))
+
+    neg_src, neg_dst = [], []
+    while len(neg_src) < n_samples:
+        u = np.random.randint(0, n_nodes)
+        v = np.random.randint(0, n_nodes)
+        if u != v and (u, v) not in edge_set and (v, u) not in edge_set:
+            neg_src.append(u)
+            neg_dst.append(v)
+
+    return torch.tensor([neg_src, neg_dst], dtype=torch.long)
+
+
+def pretrain_ssl(model, edge_predictor, x_list, edge_index_list, epochs=100, lr=0.001):
+    """
+    Self-supervised pretraining: mask 10% edges per slice, compute link prediction
+    loss at each time step independently and sum, so GRU receives gradients from
+    every slice.
+    """
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(edge_predictor.parameters()),
+        lr=lr, weight_decay=1e-5
+    )
+    n_nodes = x_list[0].shape[0]
+    is_temporal = hasattr(model, 'gru')
+
+    print("  Self-supervised pretraining (per-slice edge prediction)...")
+    for epoch in range(epochs):
+        model.train()
+        edge_predictor.train()
+        optimizer.zero_grad()
+
+        # Mask 10% edges in each time slice
+        masked_edge_lists = []
+        all_pos_edges = []
+        for ei in edge_index_list:
+            remaining_ei, masked_pos = mask_edges(ei, mask_ratio=0.1)
+            masked_edge_lists.append(remaining_ei.to(DEVICE))
+            all_pos_edges.append(masked_pos)
+
+        if is_temporal:
+            # Get GRU output at every time step: [N, T, hidden]
+            all_step_outputs = model.encode_all_steps(x_list, masked_edge_lists)
+
+            # Compute loss for EACH time slice and sum
+            total_loss = torch.tensor(0.0, device=DEVICE)
+            for t in range(len(edge_index_list)):
+                z_t = all_step_outputs[:, t, :]  # [N, hidden] at step t
+                pos_edges_t = all_pos_edges[t].to(DEVICE)
+                n_pos = pos_edges_t.shape[1]
+                if n_pos == 0:
+                    continue
+                neg_edges_t = negative_sampling(edge_index_list[t], n_nodes, n_pos).to(DEVICE)
+                pos_scores, neg_scores = edge_predictor(z_t, pos_edges_t, neg_edges_t)
+                pos_loss = F.binary_cross_entropy_with_logits(pos_scores, torch.ones_like(pos_scores))
+                neg_loss = F.binary_cross_entropy_with_logits(neg_scores, torch.zeros_like(neg_scores))
+                total_loss = total_loss + pos_loss + neg_loss
+        else:
+            # GIN-Only: encode last slice, predict last slice edges
+            z = model.gin_encoder(x_list[-1], masked_edge_lists[-1])
+            pos_edges = all_pos_edges[-1].to(DEVICE)
+            n_pos = pos_edges.shape[1]
+            if n_pos == 0:
+                continue
+            neg_edges = negative_sampling(edge_index_list[-1], n_nodes, n_pos).to(DEVICE)
+            pos_scores, neg_scores = edge_predictor(z, pos_edges, neg_edges)
+            pos_loss = F.binary_cross_entropy_with_logits(pos_scores, torch.ones_like(pos_scores))
+            neg_loss = F.binary_cross_entropy_with_logits(neg_scores, torch.zeros_like(neg_scores))
+            total_loss = pos_loss + neg_loss
+
+        total_loss.backward()
+        optimizer.step()
+
+        if (epoch + 1) % 50 == 0:
+            print(f"    Epoch {epoch+1}: SSL Loss={total_loss.item():.4f}")
+
+    return model, edge_predictor
+
+
+# =============================================================================
+# 4. Supervised Training and Evaluation
+# =============================================================================
+
+def train_supervised(model, x_list, edge_index_list, labels, train_mask, val_mask,
+                     epochs=150, lr=0.005):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
     best_val_f1 = 0
     best_state = None
     patience = 30
     no_improve = 0
-    best_epoch = 0
-    best_train_loss = 0.0
+    val_f1_history = []
+
+    y = labels.to(DEVICE)
 
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
-        out = model(data.x, data.edge_index)
-        loss = F.cross_entropy(out[train_mask], data.y[train_mask])
+        out = model(x_list, edge_index_list)
+        loss = F.cross_entropy(out[train_mask], y[train_mask])
         loss.backward()
         optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            val_out = model(data.x, data.edge_index)
+            val_out = model(x_list, edge_index_list)
             val_pred = val_out[val_mask].argmax(dim=1).cpu().numpy()
-            val_true = data.y[val_mask].cpu().numpy()
+            val_true = y[val_mask].cpu().numpy()
             val_f1 = f1_score(val_true, val_pred, average='macro')
+
+        val_f1_history.append(val_f1)
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            best_train_loss = loss.item()
-            best_epoch = epoch + 1
-            best_state = model.state_dict().copy()
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
             no_improve = 0
         else:
             no_improve += 1
@@ -249,258 +449,260 @@ def train_model(model, data, train_mask, val_mask, epochs=200, lr=0.01):
             break
 
         if (epoch + 1) % 50 == 0:
-            print(f"  Epoch {epoch+1}: Loss={loss.item():.4f}, Val F1={val_f1:.4f}")
+            print(f"    Epoch {epoch+1}: Loss={loss.item():.4f}, Val F1={val_f1:.4f}")
 
     model.load_state_dict(best_state)
-    print(f"  Best @ Epoch {best_epoch}: Train Loss={best_train_loss:.4f}, Val F1={best_val_f1:.4f}")
-    return model
+    print(f"    Best Val F1: {best_val_f1:.4f}")
+    return model, val_f1_history
 
 
-def evaluate_model(model, data, test_mask):
+def evaluate_model(model, x_list, edge_index_list, labels, test_mask, low_activity_mask):
     model.eval()
     with torch.no_grad():
-        out = model(data.x, data.edge_index)
+        out = model(x_list, edge_index_list)
         pred = out[test_mask].argmax(dim=1).cpu().numpy()
-        true = data.y[test_mask].cpu().numpy()
-    f1_macro = f1_score(true, pred, average='macro')
-    f1_per_class = f1_score(true, pred, average=None)
+        true = labels[test_mask].cpu().numpy()
+
+    overall_recall_bot = recall_score(true, pred, pos_label=1)
+    overall_precision_bot = precision_score(true, pred, pos_label=1)
+    overall_f1 = f1_score(true, pred, average='macro')
+
+    test_indices = torch.where(test_mask)[0].cpu().numpy()
+    low_act_in_test = low_activity_mask[test_indices]
+    bot_in_test = true == 1
+    low_act_bot_mask = low_act_in_test & bot_in_test
+
+    if low_act_bot_mask.sum() > 0:
+        low_act_pred = pred[low_act_bot_mask]
+        low_activity_recall = (low_act_pred == 1).sum() / low_act_bot_mask.sum()
+    else:
+        low_activity_recall = 0.0
+
     report = classification_report(true, pred, target_names=['Genuine', 'Bot'])
-    return f1_macro, f1_per_class, report
+
+    return {
+        'overall_recall_bot': overall_recall_bot,
+        'overall_precision_bot': overall_precision_bot,
+        'overall_f1': overall_f1,
+        'low_activity_recall': float(low_activity_recall),
+        'report': report,
+    }
 
 
 # =============================================================================
-# 4. Visualization: GIN First-Layer Neighbor Aggregation
+# 5. Visualization
 # =============================================================================
 
-def visualize_gin_aggregation(model, data, n_samples=20):
-    """
-    Visualize how GIN first layer aggregates neighbor information.
-    Shows the embedding patterns of sampled nodes and their neighborhoods.
-    """
-    model.eval()
-    with torch.no_grad():
-        h1 = model.get_first_layer_output(data.x, data.edge_index).cpu().numpy()
+def visualize_comparison(results_gru, results_no_gru, val_history_gru, val_history_no_gru,
+                         model_gru, x_list, edge_index_list, labels, low_activity_mask, test_mask):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
 
-    labels = data.y.cpu().numpy()
-    n_nodes = len(labels)
-    edge_index_np = data.edge_index.cpu().numpy()
-
-    # Precompute adjacency list from edge_index (bidirectional)
-    adj_list = [[] for _ in range(n_nodes)]
-    for i in range(edge_index_np.shape[1]):
-        src, dst = edge_index_np[0, i], edge_index_np[1, i]
-        adj_list[src].append(dst)
-    # Deduplicate neighbors
-    adj_list = [np.unique(np.array(neighbors)) if neighbors else np.array([], dtype=int)
-                for neighbors in adj_list]
-    degrees = np.array([len(adj_list[i]) for i in range(n_nodes)])
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-
-    # (a) t-SNE-like 2D projection of first layer embeddings
-    from sklearn.decomposition import PCA
-    pca = PCA(n_components=2)
-    h1_2d = pca.fit_transform(h1)
-
+    # (a) Recall comparison bar chart
     ax = axes[0, 0]
-    colors = ['#2ecc71' if l == 0 else '#e74c3c' for l in labels]
-    ax.scatter(h1_2d[:, 0], h1_2d[:, 1], c=colors, alpha=0.3, s=8)
-    ax.set_title('GIN Layer-1 Embeddings (PCA)', fontsize=12)
+    metrics = ['Overall Bot\nRecall', 'Low-Activity\nBot Recall', 'Macro F1']
+    gru_vals = [results_gru['overall_recall_bot'], results_gru['low_activity_recall'], results_gru['overall_f1']]
+    no_gru_vals = [results_no_gru['overall_recall_bot'], results_no_gru['low_activity_recall'], results_no_gru['overall_f1']]
+
+    x_pos = np.arange(len(metrics))
+    width = 0.35
+    bars1 = ax.bar(x_pos - width/2, gru_vals, width, label='GIN+GRU', color='#3498db', edgecolor='black')
+    bars2 = ax.bar(x_pos + width/2, no_gru_vals, width, label='GIN-Only', color='#e67e22', edgecolor='black')
+
+    for bar, val in zip(bars1, gru_vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    for bar, val in zip(bars2, no_gru_vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(metrics)
+    ax.set_ylabel('Score')
+    ax.set_ylim(0, 1.1)
+    ax.set_title('(a) GIN+GRU vs GIN-Only: Key Metrics', fontsize=12)
+    ax.legend(loc='upper right')
+    ax.grid(axis='y', alpha=0.3)
+
+    # (b) Training curves
+    ax = axes[0, 1]
+    ax.plot(val_history_gru, label='GIN+GRU', color='#3498db', linewidth=2)
+    ax.plot(val_history_no_gru, label='GIN-Only', color='#e67e22', linewidth=2)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Validation F1 (Macro)')
+    ax.set_title('(b) Fine-tuning Validation Curves (200 labels)', fontsize=12)
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # (c) PCA of GIN+GRU embeddings
+    ax = axes[1, 0]
+    model_gru.eval()
+    with torch.no_grad():
+        embeddings = model_gru.encode_temporal(x_list, edge_index_list).cpu().numpy()
+
+    pca = PCA(n_components=2)
+    emb_2d = pca.fit_transform(embeddings)
+
+    labels_np = labels.cpu().numpy()
+    genuine_mask = labels_np == 0
+    bot_mask = (labels_np == 1) & (~low_activity_mask)
+    low_act_mask = low_activity_mask
+
+    ax.scatter(emb_2d[genuine_mask, 0], emb_2d[genuine_mask, 1],
+               c='#2ecc71', alpha=0.2, s=8, label='Genuine')
+    ax.scatter(emb_2d[bot_mask, 0], emb_2d[bot_mask, 1],
+               c='#e74c3c', alpha=0.3, s=12, label='Regular Bot')
+    ax.scatter(emb_2d[low_act_mask, 0], emb_2d[low_act_mask, 1],
+               c='#9b59b6', alpha=0.6, s=25, marker='^', label='Low-Activity Bot')
+    ax.set_title('(c) GIN+GRU Embeddings (PCA)', fontsize=12)
     ax.set_xlabel('PC1')
     ax.set_ylabel('PC2')
-    from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='#2ecc71', label='Genuine'),
-                       Patch(facecolor='#e74c3c', label='Bot')]
-    ax.legend(handles=legend_elements, loc='upper right')
+    ax.legend(fontsize=9)
 
-    # (b) Neighbor label distribution for sample nodes
-    ax = axes[0, 1]
-    sample_bots = np.random.choice(np.where(labels == 1)[0], n_samples // 2, replace=False)
-    sample_genuine = np.random.choice(np.where(labels == 0)[0], n_samples // 2, replace=False)
-    sample_nodes = np.concatenate([sample_genuine, sample_bots])
-
-    neighbor_stats = []
-    for node in sample_nodes:
-        neighbors = adj_list[node]
-        if len(neighbors) == 0:
-            neighbor_stats.append((0, 0))
-            continue
-        n_bot_neighbors = (labels[neighbors] == 1).sum()
-        n_genuine_neighbors = (labels[neighbors] == 0).sum()
-        neighbor_stats.append((n_genuine_neighbors, n_bot_neighbors))
-
-    genuine_counts = [s[0] for s in neighbor_stats]
-    bot_counts = [s[1] for s in neighbor_stats]
-    x_pos = np.arange(len(sample_nodes))
-    bar_colors = ['#2ecc71' if labels[n] == 0 else '#e74c3c' for n in sample_nodes]
-
-    ax.bar(x_pos, genuine_counts, label='Genuine neighbors', color='#2ecc71', alpha=0.7)
-    ax.bar(x_pos, bot_counts, bottom=genuine_counts, label='Bot neighbors', color='#e74c3c', alpha=0.7)
-    ax.set_xlabel('Sampled Nodes')
-    ax.set_ylabel('Neighbor Count')
-    ax.set_title('Neighbor Label Distribution (GIN Aggregation)', fontsize=12)
-    ax.legend()
-    for i, color in enumerate(bar_colors):
-        ax.axvline(x=i, color=color, alpha=0.1, linewidth=3)
-
-    # (c) Feature heatmap of aggregated embeddings
-    ax = axes[1, 0]
-    h1_sample = h1[sample_nodes]
-    sns.heatmap(h1_sample, ax=ax, cmap='RdBu_r', center=0,
-                yticklabels=[f"{'G' if labels[n]==0 else 'B'}{i}" for i, n in enumerate(sample_nodes)],
-                xticklabels=False)
-    ax.set_title('GIN Layer-1 Aggregated Features (Sample)', fontsize=12)
-    ax.set_xlabel('Hidden Dimensions')
-    ax.set_ylabel('Nodes (G=Genuine, B=Bot)')
-
-    # (d) Ego-network visualization for a bot and a genuine user
+    # (d) Degree evolution across time slices
     ax = axes[1, 1]
-    bot_candidates = np.where((labels == 1) & (degrees >= 5) & (degrees <= 20))[0]
-    genuine_candidates = np.where((labels == 0) & (degrees >= 5) & (degrees <= 20))[0]
+    n_nodes = len(labels_np)
+    degrees_per_day = []
+    for ei in edge_index_list:
+        ei_np = ei.cpu().numpy()
+        deg = np.zeros(n_nodes)
+        for i in range(ei_np.shape[1]):
+            deg[ei_np[0, i]] += 1
+        degrees_per_day.append(deg)
 
-    if len(bot_candidates) > 0 and len(genuine_candidates) > 0:
-        center_bot = np.random.choice(bot_candidates)
-        center_genuine = np.random.choice(genuine_candidates)
+    low_bot_idx = np.where(low_activity_mask)[0][:5]
+    reg_bot_idx = np.where((labels_np == 1) & (~low_activity_mask))[0][:5]
+    genuine_idx = np.where(labels_np == 0)[0][:5]
 
-        G = nx.Graph()
-        bot_neighbors = adj_list[center_bot][:10]
-        G.add_node(f"B_{center_bot}", node_type='bot_center')
-        for nb in bot_neighbors:
-            ntype = 'bot' if labels[nb] == 1 else 'genuine'
-            G.add_node(f"N_{nb}", node_type=ntype)
-            G.add_edge(f"B_{center_bot}", f"N_{nb}")
+    days = [1, 2, 3]
+    for idx in low_bot_idx:
+        degs = [degrees_per_day[d][idx] for d in range(3)]
+        ax.plot(days, degs, 'v-', color='#9b59b6', alpha=0.6, markersize=5)
+    for idx in reg_bot_idx:
+        degs = [degrees_per_day[d][idx] for d in range(3)]
+        ax.plot(days, degs, 'o-', color='#e74c3c', alpha=0.4, markersize=4)
+    for idx in genuine_idx:
+        degs = [degrees_per_day[d][idx] for d in range(3)]
+        ax.plot(days, degs, 's-', color='#2ecc71', alpha=0.4, markersize=4)
 
-        genuine_neighbors = adj_list[center_genuine][:10]
-        G.add_node(f"G_{center_genuine}", node_type='genuine_center')
-        for nb in genuine_neighbors:
-            ntype = 'bot' if labels[nb] == 1 else 'genuine'
-            G.add_node(f"N2_{nb}", node_type=ntype)
-            G.add_edge(f"G_{center_genuine}", f"N2_{nb}")
-
-        color_map = []
-        for node in G.nodes():
-            nt = G.nodes[node]['node_type']
-            if nt == 'bot_center':
-                color_map.append('#c0392b')
-            elif nt == 'genuine_center':
-                color_map.append('#27ae60')
-            elif nt == 'bot':
-                color_map.append('#e74c3c')
-            else:
-                color_map.append('#2ecc71')
-
-        pos = nx.spring_layout(G, seed=42)
-        nx.draw(G, pos, ax=ax, node_color=color_map, node_size=200,
-                edge_color='#bdc3c7', width=1.5, with_labels=False)
-        ax.set_title('Ego Networks: GIN Aggregation Pattern', fontsize=12)
-        legend_elements = [
-            Patch(facecolor='#c0392b', label='Bot (center)'),
-            Patch(facecolor='#27ae60', label='Genuine (center)'),
-            Patch(facecolor='#e74c3c', label='Bot (neighbor)'),
-            Patch(facecolor='#2ecc71', label='Genuine (neighbor)'),
-        ]
-        ax.legend(handles=legend_elements, loc='upper left', fontsize=8)
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='#9b59b6', marker='v', label='Low-Activity Bot'),
+        Line2D([0], [0], color='#e74c3c', marker='o', label='Regular Bot'),
+        Line2D([0], [0], color='#2ecc71', marker='s', label='Genuine'),
+    ]
+    ax.legend(handles=legend_elements, fontsize=9)
+    ax.set_xlabel('Day')
+    ax.set_ylabel('Node Degree')
+    ax.set_title('(d) Degree Evolution Across Time Slices', fontsize=12)
+    ax.set_xticks(days)
+    ax.grid(alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, 'gin_aggregation_visualization.png'), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(OUTPUT_DIR, 'temporal_gin_gru_comparison.png'), dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  Visualization saved to {OUTPUT_DIR}/gin_aggregation_visualization.png")
+    print(f"  Visualization saved to {OUTPUT_DIR}/temporal_gin_gru_comparison.png")
 
 
 # =============================================================================
-# 5. Main Pipeline
+# 6. Main Pipeline
 # =============================================================================
 
 def main():
     print("=" * 60)
-    print("Cresci-2017 Bot Detection with GNN")
+    print("Temporal Bot Detection: GIN+GRU vs GIN-Only")
+    print("Self-Supervised Edge Prediction | 200 Labeled Samples")
     print("=" * 60)
 
     # --- Data Preparation ---
-    print("\n[1/4] Simulating Cresci-2017 dataset...")
-    features, labels, indices = simulate_cresci2017(n_users=5000, bot_ratio=0.4)
+    print("\n[1/5] Simulating temporal Cresci-2017 dataset...")
+    features_per_day, labels, low_activity_mask = simulate_cresci2017_temporal(
+        n_users=5000, bot_ratio=0.4)
     print(f"  Users: {len(labels)}, Genuine: {(labels==0).sum()}, Bots: {(labels==1).sum()}")
-    print(f"  Features: followers, friends, tweet_freq, url_ratio, sentiment")
+    print(f"  Low-activity bots: {low_activity_mask.sum()}")
+    print(f"  Time-varying features: {len(features_per_day)} days x {features_per_day[0].shape}")
 
-    print("\n[2/4] Building co-mention graph...")
-    edge_index = build_comention_graph(n_users=5000, n_edges=15000, labels=labels)
-    print(f"  Edges (undirected): {edge_index.shape[1] // 2}")
+    print("\n[2/5] Building temporal co-mention graphs (3 days)...")
+    edge_index_list = build_temporal_graphs(n_users=5000, labels=labels,
+                                            low_activity_mask=low_activity_mask)
+    for i, ei in enumerate(edge_index_list):
+        print(f"  Day {i+1}: {ei.shape[1]//2} undirected edges")
 
-    # Build PyG data object
-    x = torch.tensor(features, dtype=torch.float)
-    y = torch.tensor(labels, dtype=torch.long)
-    data = Data(x=x, y=y, edge_index=edge_index).to(DEVICE)
+    # Move to device
+    x_list = [torch.tensor(f, dtype=torch.float).to(DEVICE) for f in features_per_day]
+    y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
+    edge_index_list_dev = [ei.to(DEVICE) for ei in edge_index_list]
 
-    # Train/Val/Test split: 70/20/10
+    # --- Label split: only 200 for training ---
     all_indices = np.arange(len(labels))
-    train_idx, temp_idx = train_test_split(all_indices, test_size=0.3, random_state=SEED, stratify=labels)
-    val_idx, test_idx = train_test_split(temp_idx, test_size=1/3, random_state=SEED, stratify=labels[temp_idx])
+    train_idx, rest_idx = train_test_split(all_indices, train_size=200,
+                                            random_state=SEED, stratify=labels)
+    val_idx, test_idx = train_test_split(rest_idx, train_size=200,
+                                          random_state=SEED, stratify=labels[rest_idx])
 
-    train_mask = torch.zeros(len(labels), dtype=torch.bool)
-    val_mask = torch.zeros(len(labels), dtype=torch.bool)
-    test_mask = torch.zeros(len(labels), dtype=torch.bool)
+    train_mask = torch.zeros(len(labels), dtype=torch.bool, device=DEVICE)
+    val_mask = torch.zeros(len(labels), dtype=torch.bool, device=DEVICE)
+    test_mask = torch.zeros(len(labels), dtype=torch.bool, device=DEVICE)
     train_mask[train_idx] = True
     val_mask[val_idx] = True
     test_mask[test_idx] = True
-    train_mask = train_mask.to(DEVICE)
-    val_mask = val_mask.to(DEVICE)
-    test_mask = test_mask.to(DEVICE)
 
-    print(f"  Split: Train={train_mask.sum().item()}, Val={val_mask.sum().item()}, Test={test_mask.sum().item()}")
+    print(f"  Labels: Train=200, Val=200, Test={test_mask.sum().item()}")
 
-    # --- Model Training and Evaluation ---
-    print("\n[3/4] Training models...")
-    results = {}
+    # --- Self-Supervised Pretraining ---
+    print("\n[3/5] Self-supervised pretraining (10% edge masking, per-slice loss)...")
 
-    models = {
-        'GIN': GINNet(in_channels=5, hidden_channels=64, num_classes=2),
-        'GCN': GCNNet(in_channels=5, hidden_channels=64, num_classes=2),
-        'GraphSAGE': GraphSAGENet(in_channels=5, hidden_channels=64, num_classes=2),
-    }
+    print("\n  >> GIN+GRU Model:")
+    model_gru = TemporalGINGRU(in_channels=5, hidden_channels=64, num_classes=2).to(DEVICE)
+    edge_pred_gru = EdgePredictor(hidden_channels=64).to(DEVICE)
+    model_gru, edge_pred_gru = pretrain_ssl(model_gru, edge_pred_gru, x_list,
+                                             edge_index_list_dev, epochs=100, lr=0.001)
 
-    for name, model in models.items():
-        print(f"\n  --- {name} ---")
-        model = model.to(DEVICE)
-        model = train_model(model, data, train_mask, val_mask, epochs=200, lr=0.01)
-        f1_macro, f1_per_class, report = evaluate_model(model, data, test_mask)
-        results[name] = {'f1_macro': f1_macro, 'f1_per_class': f1_per_class, 'report': report}
-        models[name] = model
-        print(f"  Test F1 (macro): {f1_macro:.4f}")
-        print(f"  F1 per class - Genuine: {f1_per_class[0]:.4f}, Bot: {f1_per_class[1]:.4f}")
+    print("\n  >> GIN-Only Model:")
+    model_no_gru = GINOnly(in_channels=5, hidden_channels=64, num_classes=2).to(DEVICE)
+    edge_pred_no_gru = EdgePredictor(hidden_channels=64).to(DEVICE)
+    model_no_gru, edge_pred_no_gru = pretrain_ssl(model_no_gru, edge_pred_no_gru, x_list,
+                                                    edge_index_list_dev, epochs=100, lr=0.001)
 
-    # --- Results Comparison ---
+    # --- Supervised Fine-tuning ---
+    print("\n[4/5] Fine-tuning with 200 labeled samples...")
+
+    print("\n  >> GIN+GRU:")
+    model_gru, val_hist_gru = train_supervised(model_gru, x_list, edge_index_list_dev, y,
+                                                train_mask, val_mask, epochs=150, lr=0.005)
+
+    print("\n  >> GIN-Only:")
+    model_no_gru, val_hist_no_gru = train_supervised(model_no_gru, x_list, edge_index_list_dev, y,
+                                                      train_mask, val_mask, epochs=150, lr=0.005)
+
+    # --- Evaluation ---
+    print("\n[5/5] Evaluation on test set...")
+    results_gru = evaluate_model(model_gru, x_list, edge_index_list_dev, y, test_mask, low_activity_mask)
+    results_no_gru = evaluate_model(model_no_gru, x_list, edge_index_list_dev, y, test_mask, low_activity_mask)
+
+    # --- Results ---
     print("\n" + "=" * 60)
-    print("Model Comparison (10% Test Set)")
+    print("RESULTS: GIN+GRU vs GIN-Only (200 labeled samples)")
     print("=" * 60)
-    print(f"{'Model':<12} {'F1 (Macro)':<12} {'F1 (Genuine)':<14} {'F1 (Bot)':<10}")
-    print("-" * 48)
-    for name, res in results.items():
-        print(f"{name:<12} {res['f1_macro']:<12.4f} {res['f1_per_class'][0]:<14.4f} {res['f1_per_class'][1]:<10.4f}")
+    print(f"{'Metric':<28} {'GIN+GRU':<12} {'GIN-Only':<12}")
+    print("-" * 52)
+    print(f"{'Overall Recall (Bot)':<28} {results_gru['overall_recall_bot']:<12.4f} {results_no_gru['overall_recall_bot']:<12.4f}")
+    print(f"{'Low-Activity Bot Recall':<28} {results_gru['low_activity_recall']:<12.4f} {results_no_gru['low_activity_recall']:<12.4f}")
+    print(f"{'Overall F1 (Macro)':<28} {results_gru['overall_f1']:<12.4f} {results_no_gru['overall_f1']:<12.4f}")
+    print(f"{'Precision (Bot)':<28} {results_gru['overall_precision_bot']:<12.4f} {results_no_gru['overall_precision_bot']:<12.4f}")
+    print("=" * 52)
 
-    print("\n\nDetailed Classification Report (GIN):")
-    print(results['GIN']['report'])
+    delta_recall = results_gru['low_activity_recall'] - results_no_gru['low_activity_recall']
+    print(f"\n  GRU advantage on low-activity bots: {delta_recall:+.4f} recall")
 
-    # --- F1 Comparison Bar Chart ---
-    fig, ax = plt.subplots(figsize=(8, 5))
-    model_names = list(results.keys())
-    f1_scores = [results[n]['f1_macro'] for n in model_names]
-    bars = ax.bar(model_names, f1_scores, color=['#3498db', '#e67e22', '#9b59b6'], edgecolor='black', width=0.5)
-    for bar, score in zip(bars, f1_scores):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
-                f'{score:.4f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
-    ax.set_ylabel('F1 Score (Macro)', fontsize=12)
-    ax.set_title('Bot Detection: GIN vs GCN vs GraphSAGE (10% Test Set)', fontsize=13)
-    ax.set_ylim(0, 1.0)
-    ax.grid(axis='y', alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, 'f1_comparison.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n  F1 comparison chart saved to {OUTPUT_DIR}/f1_comparison.png")
+    print("\n\nClassification Report (GIN+GRU):")
+    print(results_gru['report'])
+    print("Classification Report (GIN-Only):")
+    print(results_no_gru['report'])
 
-    # --- GIN Aggregation Visualization ---
-    print("\n[4/4] Visualizing GIN first-layer neighbor aggregation...")
-    gin_model = models['GIN']
-    visualize_gin_aggregation(gin_model, data, n_samples=20)
+    # --- Visualization ---
+    print("\nGenerating comparison visualization...")
+    visualize_comparison(results_gru, results_no_gru, val_hist_gru, val_hist_no_gru,
+                         model_gru, x_list, edge_index_list_dev, y, low_activity_mask, test_mask)
 
     print("\n" + "=" * 60)
     print("Done! All outputs saved to ./outputs/")
